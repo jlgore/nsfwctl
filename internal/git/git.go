@@ -2,6 +2,7 @@ package git
 
 import (
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -17,9 +18,7 @@ func EnsureNsfwctlRepo(repoURL, branch string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("error getting app directory: %v", err)
 	}
-
 	repoDir := filepath.Join(appDir, "infra")
-
 	if err := utils.EnsureDirectory(appDir); err != nil {
 		return "", fmt.Errorf("error creating app directory: %v", err)
 	}
@@ -93,6 +92,7 @@ func FetchBranches(repoPath string) ([]string, error) {
 		}
 		return nil
 	})
+
 	if err != nil {
 		log.Printf("Error iterating branches: %v", err)
 		return nil, fmt.Errorf("error iterating branches: %v", err)
@@ -126,4 +126,75 @@ func SwitchBranch(repoPath, branchName string) error {
 	}
 
 	return nil
+}
+
+// FetchBranchesWithDescriptions retrieves all branches and their descriptions
+func FetchBranchesWithDescriptions(repoPath string) ([]BranchInfo, error) {
+	log.Printf("Opening repository at: %s", repoPath)
+	repo, err := git.PlainOpen(repoPath)
+	if err != nil {
+		log.Printf("Error opening repository: %v", err)
+		return nil, fmt.Errorf("error opening repository: %v", err)
+	}
+
+	log.Print("Fetching branches")
+	branches, err := repo.Branches()
+	if err != nil {
+		log.Printf("Error fetching branches: %v", err)
+		return nil, fmt.Errorf("error fetching branches: %v", err)
+	}
+
+	var branchInfos []BranchInfo
+	err = branches.ForEach(func(ref *plumbing.Reference) error {
+		branchName := ref.Name().Short()
+		log.Printf("Found branch: %s", branchName)
+		if utils.IsValidBranchName(branchName) {
+			description, _ := getBranchDescription(repo, branchName)
+			branchInfos = append(branchInfos, BranchInfo{
+				Name:        branchName,
+				Description: description,
+			})
+		} else {
+			log.Printf("Invalid branch name: %s", branchName)
+		}
+		return nil
+	})
+
+	if err != nil {
+		log.Printf("Error iterating branches: %v", err)
+		return nil, fmt.Errorf("error iterating branches: %v", err)
+	}
+
+	log.Printf("Total valid branches found: %d", len(branchInfos))
+	return branchInfos, nil
+}
+
+func getBranchDescription(repo *git.Repository, branchName string) (string, error) {
+	w, err := repo.Worktree()
+	if err != nil {
+		return "", err
+	}
+
+	err = w.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName(branchName),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	descriptionPath := filepath.Join(w.Filesystem.Root(), "description.md")
+	content, err := ioutil.ReadFile(descriptionPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "No description available", nil
+		}
+		return "", err
+	}
+
+	return string(content), nil
+}
+
+type BranchInfo struct {
+	Name        string
+	Description string
 }

@@ -2,7 +2,6 @@ package ui
 
 import (
 	"fmt"
-	"log"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
@@ -10,7 +9,7 @@ import (
 	"github.com/jlgore/nsfwctl/internal/terraform"
 )
 
-type fetchBranchesMsg []string
+type fetchBranchesWithDescriptionsMsg []git.BranchInfo
 type statusMsg string
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -23,7 +22,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.list.FilterState() == list.Filtering {
 			break
 		}
-
 		switch keypress := msg.String(); keypress {
 		case "ctrl+c", "q":
 			return m, tea.Quit
@@ -38,10 +36,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case statusMsg:
 		m.status = string(msg)
 
-	case fetchBranchesMsg:
+	case fetchBranchesWithDescriptionsMsg:
 		items := make([]list.Item, len(msg))
-		for i, branch := range msg {
-			items[i] = item{title: branch, description: ""}
+		for i, branchInfo := range msg {
+			items[i] = item{title: branchInfo.Name, description: branchInfo.Description}
 		}
 		m.list.SetItems(items)
 	}
@@ -51,20 +49,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-func fetchBranchesCmd(repoPath string) tea.Cmd {
+func fetchBranchesWithDescriptionsCmd(repoPath string) tea.Cmd {
 	return func() tea.Msg {
-		log.Printf("Fetching branches from: %s", repoPath)
-		branches, err := git.FetchBranches(repoPath)
+		branchInfos, err := git.FetchBranchesWithDescriptions(repoPath)
 		if err != nil {
-			log.Printf("Error fetching branches: %v", err)
 			return statusMsg(fmt.Sprintf("Error fetching branches: %v", err))
 		}
-		log.Printf("Fetched %d branches", len(branches))
-		if len(branches) == 0 {
-			log.Print("No branches found")
-			return statusMsg("No branches found")
-		}
-		return fetchBranchesMsg(branches)
+		return fetchBranchesWithDescriptionsMsg(branchInfos)
 	}
 }
 

@@ -3,82 +3,193 @@ package main
 import (
 	"context"
 	"fmt"
+	"io/ioutil"
 	"log"
 	"os"
-	"os/user"
+	"os/exec"
 	"path/filepath"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/hashicorp/go-version"
-	"github.com/hashicorp/hc-install/product"
-	"github.com/hashicorp/hc-install/releases"
 	"github.com/hashicorp/terraform-exec/tfexec"
 )
 
-var docStyle = lipgloss.NewStyle().Margin(1, 2)
+var (
+	appStyle = lipgloss.NewStyle().Padding(1, 2)
 
-type model struct {
-	list     list.Model
-	tf       *tfexec.Terraform
-	choice   string
-	quitting bool
-}
+	titleStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FFFDF5")).
+			Background(lipgloss.Color("#25A065")).
+			Padding(0, 1)
+
+	statusMessageStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.AdaptiveColor{Light: "#04B575", Dark: "#04B575"}).
+				Render
+)
 
 type item struct {
-	title, desc string
+	title       string
+	description string
 }
 
 func (i item) Title() string       { return i.title }
-func (i item) Description() string { return i.desc }
+func (i item) Description() string { return i.description }
 func (i item) FilterValue() string { return i.title }
 
+type model struct {
+	list           list.Model
+	repoPath       string
+	status         string
+	selectedBranch string
+}
+
 func initialModel() model {
-	items := []list.Item{
-		item{title: "Network ACLs", desc: "Deploy Network Access Control Lists"},
-		item{title: "Security Groups", desc: "Configure Security Groups"},
-		item{title: "VPN Gateway", desc: "Set up a VPN Gateway"},
-		item{title: "WAF", desc: "Deploy Web Application Firewall"},
-		item{title: "Apply All", desc: "Deploy all security controls"},
+	l := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
+	l.Title = "Select a branch"
+	l.SetShowTitle(true)
+	l.SetFilteringEnabled(true)
+	l.Styles.Title = titleStyle
+
+	return model{
+		list:           l,
+		status:         "Initializing...",
+		selectedBranch: "main",
 	}
-
-	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "AWS VPC Security Controls"
-
-	return model{list: l}
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	return initializeCmd(m.repoPath)
 }
 
-func runTerraformInit(repoPath string) error {
-	// Ensure Terraform is installed and get its path
-	terraformPath, err := ensureTerraform()
-	if err != nil {
-		return fmt.Errorf("failed to ensure Terraform is installed: %v", err)
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		h, v := appStyle.GetFrameSize()
+		m.list.SetSize(msg.Width-h, msg.Height-v)
+
+	case tea.KeyMsg:
+		if m.list.FilterState() == list.Filtering {
+			break
+		}
+
+		switch keypress := msg.String(); keypress {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		case "enter":
+			i, ok := m.list.SelectedItem().(item)
+			if ok {
+				m.selectedBranch = i.title
+				return m, switchBranchCmd(m.repoPath, m.selectedBranch)
+			}
+		}
+
+	case statusMsg:
+		m.status = string(msg)
+
+	case branchesMsg:
+		items := make([]list.Item, len(msg))
+		for i, branch := range msg {
+			items[i] = item{title: branch, description: ""}
+		}
+		m.list.SetItems(items)
 	}
 
-	// Create a new Terraform object
-	tf, err := tfexec.NewTerraform(repoPath, terraformPath)
+	var cmd tea.Cmd
+	m.list, cmd = m.list.Update(msg)
+	return m, cmd
+}
+
+func (m model) View() string {
+	return appStyle.Render(fmt.Sprintf(
+		"nsfwctl\n\n"+
+			"Repository: %s\n"+
+			"Current Branch: %s\n"+
+			"Status: %s\n\n%s",
+		m.repoPath,
+		m.selectedBranch,
+		m.status,
+		m.list.View(),
+	))
+}
+
+type statusMsg string
+type branchesMsg []string
+type initMsg string
+
+func initializeCmd(repoPath string) tea.Cmd {
+	return func() tea.Msg {
+		err := updateRepo(repoPath)
+		if err != nil {
+			return statusMsg(fmt.Sprintf("Error updating repo: %v", err))
+		}
+
+		initResult := runTerraformInit(repoPath)
+		fmt.Println(initResult)
+
+		branches, err := fetchBranches(repoPath)
+		if err != nil {
+			return statusMsg(fmt.Sprintf("Error fetching branches: %v", err))
+		}
+
+		return branchesMsg(branches)
+	}
+}
+
+func fetchBranches(repoPath string) ([]string, error) {
+	repo, err := git.PlainOpen(repoPath)
 	if err != nil {
-		return fmt.Errorf("error creating Terraform object: %v", err)
+		return nil, fmt.Errorf("error opening repository: %v", err)
 	}
 
-	// Set working directory to where your Terraform configurations are
-	workingDir := filepath.Join(repoPath, "path/to/terraform/configs")
-	tf.SetWorkingDir(workingDir)
-
-	// Run terraform init
-	err = tf.Init(context.Background(), tfexec.Upgrade(true))
+	branches, err := repo.Branches()
 	if err != nil {
-		return fmt.Errorf("error running terraform init: %v", err)
+		return nil, fmt.Errorf("error fetching branches: %v", err)
 	}
 
-	fmt.Println("Terraform init completed successfully")
+	var branchNames []string
+	err = branches.ForEach(func(ref *plumbing.Reference) error {
+		branchNames = append(branchNames, ref.Name().Short())
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("error iterating branches: %v", err)
+	}
+
+	return branchNames, nil
+}
+
+func switchBranchCmd(repoPath, branchName string) tea.Cmd {
+	return func() tea.Msg {
+		err := switchBranch(repoPath, branchName)
+		if err != nil {
+			return statusMsg(fmt.Sprintf("Error switching branch: %v", err))
+		}
+		return statusMsg(fmt.Sprintf("Switched to branch: %s", branchName))
+	}
+}
+
+func switchBranch(repoPath, branchName string) error {
+	repo, err := git.PlainOpen(repoPath)
+	if err != nil {
+		return fmt.Errorf("error opening repository: %v", err)
+	}
+
+	w, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("error getting worktree: %v", err)
+	}
+
+	err = w.Checkout(&git.CheckoutOptions{
+		Branch: plumbing.NewBranchReferenceName(branchName),
+	})
+	if err != nil {
+		return fmt.Errorf("error checking out branch: %v", err)
+	}
+
 	return nil
 }
 
@@ -89,17 +200,14 @@ func ensureNsfwctlRepo(repoURL, branch string) (string, error) {
 	}
 
 	nsfwctlDir := filepath.Join(homeDir, ".nsfwctl")
-	repoDir := filepath.Join(nsfwctlDir, "terraform-repo")
+	repoDir := filepath.Join(nsfwctlDir, "infra")
 
-	// Ensure .nsfwctl directory exists
 	if err := os.MkdirAll(nsfwctlDir, 0755); err != nil {
 		return "", fmt.Errorf("error creating .nsfwctl directory: %v", err)
 	}
 
-	// Check if the repository already exists
-	repo, err := git.PlainOpen(repoDir)
+	_, err = git.PlainOpen(repoDir)
 	if err != nil {
-		// Repository doesn't exist, clone it
 		fmt.Println("Cloning repository...")
 		_, err = git.PlainClone(repoDir, false, &git.CloneOptions{
 			URL:           repoURL,
@@ -110,64 +218,96 @@ func ensureNsfwctlRepo(repoURL, branch string) (string, error) {
 			return "", fmt.Errorf("error cloning repository: %v", err)
 		}
 	} else {
-		// Repository exists, pull latest changes
-		fmt.Println("Updating repository...")
-		w, err := repo.Worktree()
-		if err != nil {
-			return "", fmt.Errorf("error getting worktree: %v", err)
-		}
-
-		err = w.Pull(&git.PullOptions{
-			RemoteName:    "origin",
-			ReferenceName: plumbing.NewBranchReferenceName(branch),
-			Progress:      os.Stdout,
-		})
-		if err != nil && err != git.NoErrAlreadyUpToDate {
-			return "", fmt.Errorf("error pulling repository: %v", err)
-		}
+		fmt.Println("Repository already exists. Updating...")
 	}
 
-	fmt.Println("Repository is up to date.")
 	return repoDir, nil
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "ctrl+c", "q":
-			m.quitting = true
-			return m, tea.Quit
-		case "enter":
-			i, ok := m.list.SelectedItem().(item)
-			if ok {
-				m.choice = i.title
-				return m, tea.Quit
-			}
-		}
-	case tea.WindowSizeMsg:
-		h, v := docStyle.GetFrameSize()
-		m.list.SetSize(msg.Width-h, msg.Height-v)
+func updateRepo(repoPath string) error {
+	repo, err := git.PlainOpen(repoPath)
+	if err != nil {
+		return fmt.Errorf("error opening repository: %v", err)
 	}
 
-	var cmd tea.Cmd
-	m.list, cmd = m.list.Update(msg)
-	return m, cmd
+	w, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("error getting worktree: %v", err)
+	}
+
+	err = w.Pull(&git.PullOptions{RemoteName: "origin"})
+	if err != nil && err != git.NoErrAlreadyUpToDate {
+		return fmt.Errorf("error pulling repository: %v", err)
+	}
+
+	return nil
 }
 
-func (m model) View() string {
-	if m.quitting {
-		return "Bye!\n"
+func runTerraformInit(repoPath string) string {
+	log.Printf("Starting Terraform init process in: %s", repoPath)
+
+	terraformPath, err := exec.LookPath("terraform")
+	if err != nil {
+		return fmt.Sprintf("terraform not found in PATH: %v", err)
 	}
-	if m.choice != "" {
-		return fmt.Sprintf("You chose %s!\n", m.choice)
+	log.Printf("Terraform executable found at: %s", terraformPath)
+
+	tf, err := tfexec.NewTerraform(repoPath, terraformPath)
+	if err != nil {
+		return fmt.Sprintf("error creating Terraform object: %v", err)
 	}
-	return docStyle.Render(m.list.View())
+
+	logFile := filepath.Join(repoPath, "terraform-init.log")
+	f, err := os.Create(logFile)
+	if err != nil {
+		return fmt.Sprintf("error creating log file: %v", err)
+	}
+	defer f.Close()
+
+	tf.SetLogger(log.New(f, "", log.Ldate|log.Ltime))
+
+	var stdout, stderr strings.Builder
+	tf.SetStdout(&stdout)
+	tf.SetStderr(&stderr)
+
+	log.Println("Running Terraform init...")
+	err = tf.Init(context.Background(), tfexec.Upgrade(true), tfexec.Reconfigure(true))
+	if err != nil {
+		log.Printf("Error running terraform init: %v", err)
+		return fmt.Sprintf("error running terraform init: %v\nStderr: %s", err, stderr.String())
+	}
+
+	log.Println("Terraform init completed successfully")
+
+	terraformDir := filepath.Join(repoPath, ".terraform")
+	var terraformContents strings.Builder
+	err = filepath.Walk(terraformDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(terraformDir, path)
+		if err != nil {
+			return err
+		}
+		terraformContents.WriteString(fmt.Sprintf(".terraform contents: %s\n", rel))
+		return nil
+	})
+	if err != nil {
+		log.Printf("Error walking .terraform directory: %v", err)
+	}
+
+	providersFile := filepath.Join(repoPath, "providers.tf")
+	providersContent, err := ioutil.ReadFile(providersFile)
+	if err != nil {
+		log.Printf("Error reading providers.tf: %v", err)
+	}
+
+	return fmt.Sprintf("Terraform init completed successfully.\n\nInit Output:\n%s\n\nStderr:\n%s\n\n.terraform contents:\n%s\n\nproviders.tf contents:\n%s",
+		stdout.String(), stderr.String(), terraformContents.String(), string(providersContent))
 }
 
 func main() {
-
-	repoURL := "https://github.com/jlgore/nsfw-infra.git"
+	repoURL := "https://github.com/jlgore/nsfw-infra"
 	branch := "main"
 
 	repoPath, err := ensureNsfwctlRepo(repoURL, branch)
@@ -176,74 +316,12 @@ func main() {
 	}
 
 	fmt.Printf("Terraform repository is located at: %s\n", repoPath)
-	// Initialize Terraform
-	installer := &releases.ExactVersion{
-		Product: product.Terraform,
-		Version: version.Must(version.NewVersion("1.9.1")),
-	}
-	execPath, err := installer.Install(context.Background())
-	if err != nil {
-		log.Fatalf("error installing Terraform: %s", err)
-	}
 
-	// Get the current user
-	currentUser, err := user.Current()
-	if err != nil {
-		log.Fatalf("Error getting current user: %v", err)
-	}
-	// Get the home directory
-	homeDir := currentUser.HomeDir
+	initialState := initialModel()
+	initialState.repoPath = repoPath
 
-	// Define the path for the .nsfwctl folder
-	nsfwctlDir := filepath.Join(homeDir, ".nsfwctl")
-
-	// Check if the directory exists
-	_, err = os.Stat(nsfwctlDir)
-	if os.IsNotExist(err) {
-		// Directory doesn't exist, so create it
-		err = os.Mkdir(nsfwctlDir, 0755)
-		if err != nil {
-			log.Fatalf("Error creating directory: %v", err)
-		}
-		fmt.Printf("Created directory: %s\n", nsfwctlDir)
-	} else if err != nil {
-		// Some other error occurred
-		log.Fatalf("Error checking directory: %v", err)
-	} else {
-		fmt.Printf("Directory already exists: %s\n", nsfwctlDir)
-	}
-
-	tf, err := tfexec.NewTerraform(nsfwctlDir, execPath)
-	if err != nil {
-		log.Fatalf("error running NewTerraform: %s", err)
-	}
-
-	err = tf.Init(context.Background(), tfexec.Upgrade(true))
-	if err != nil {
-		log.Fatalf("error running Init: %s", err)
-	}
-
-	// Run Bubble Tea
-	p := tea.NewProgram(initialModel())
-	m, err := p.Run()
-	if err != nil {
-		fmt.Printf("Alas, there's been an error: %v", err)
-		os.Exit(1)
-	}
-
-	// Process the user's choice
-	if m, ok := m.(model); ok {
-		switch m.choice {
-		case "Network ACLs":
-			// Apply Network ACLs Terraform module
-		case "Security Groups":
-			// Apply Security Groups Terraform module
-		case "VPN Gateway":
-			// Apply VPN Gateway Terraform module
-		case "WAF":
-			// Apply WAF Terraform module
-		case "Apply All":
-			// Apply all modules
-		}
+	p := tea.NewProgram(initialState, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		log.Fatal(err)
 	}
 }

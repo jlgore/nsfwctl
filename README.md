@@ -1,4 +1,4 @@
-# nsftctl (network security framework trainer)
+# nsfwctl (network security framework trainer)
 
 
  ███▄    █   ██████   █████▒█     █░ ▄████▄  ▄▄▄█████▓ ██▓    

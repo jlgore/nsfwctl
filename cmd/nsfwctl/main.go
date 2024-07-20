@@ -1,103 +1,75 @@
-resource "random_pet" "stack" {
-  length = 2
-  separator = "-"
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+
+	"github.com/jlgore/nsfwctl/internal/config"
+	"github.com/jlgore/nsfwctl/internal/git"
+	"github.com/jlgore/nsfwctl/internal/ui"
+	"github.com/jlgore/nsfwctl/pkg/utils"
+
+	tea "github.com/charmbracelet/bubbletea"
+)
+
+func main() {
+	// Initialize configuration
+	if err := config.Init(); err != nil {
+		log.Fatalf("Failed to initialize config: %v", err)
+	}
+
+	// Setup logging
+	logFile, err := setupLogging()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error setting up logging: %v\n", err)
+		os.Exit(1)
+	}
+	defer logFile.Close()
+
+	// Ensure the repository exists and is up to date
+	repoPath, err := git.EnsureNsfwctlRepo(config.CurrentConfig.RepoURL, config.CurrentConfig.DefaultBranch)
+	if err != nil {
+		log.Printf("Failed to ensure repository: %v", err)
+		fmt.Fprintf(os.Stderr, "Failed to ensure repository: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Terraform repository is located at: %s\n", repoPath)
+
+	// Initialize the UI model
+	initialState := ui.NewModel(repoPath)
+
+	// Run the application
+	p := tea.NewProgram(initialState, tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		log.Printf("Error running program: %v", err)
+		fmt.Fprintf(os.Stderr, "Error running program: %v\n", err)
+		os.Exit(1)
+	}
 }
 
+func setupLogging() (*os.File, error) {
+	appDir, err := utils.GetAppDir()
+	if err != nil {
+		return nil, fmt.Errorf("error getting app directory: %v", err)
+	}
 
-terraform {
-  backend "s3" {
-    bucket         = "tf-state-credible-lemming"
-    key            = "credible-lemming/terraform.tfstate"
-    region         = "us-east-1"
-    dynamodb_table = "tf-locks-credible-lemming"
-    encrypt        = true
-  }
-}
+	if err := utils.EnsureDirectory(appDir); err != nil {
+		return nil, fmt.Errorf("error creating app directory: %v", err)
+	}
 
-module "vpc" {
-  source = "./modules/vpc"
-  vpc_cidr = "10.0.0.0/16"
-  public_subnet_cidrs = ["10.0.1.0/24", "10.0.2.0/24"]
-  private_subnet_cidrs = ["10.0.3.0/24", "10.0.4.0/24"]
-  availability_zones = ["us-east-1a", "us-east-1b"]
-  enable_flow_log = true
-  flow_log_retention_in_days = 30
-  vpc_name = "${random_pet.stack.id}-vpc"
-}
+	logPath := config.CurrentConfig.LogFile
+	if !filepath.IsAbs(logPath) {
+		logPath = filepath.Join(appDir, logPath)
+	}
 
-module "sg" {
-  source = "./modules/sg"
-  name = "${random_pet.stack.id}-sg"
-  description = "Security group for ${random_pet.stack.id} stack"
-  vpc_id = module.vpc.vpc_id
-  ingress_rules = [
-    {
-      description = "Allow HTTP from anywhere"
-      from_port = 80
-      to_port = 80
-      protocol = "tcp"
-      cidr_blocks = ["0.0.0.0/0"]
-      ipv6_cidr_blocks = ["::/0"]
-    },
-    {
-      description = "Allow HTTPS from anywhere"
-      from_port = 443
-      to_port = 443
-      protocol = "tcp"
-      cidr_blocks = ["0.0.0.0/0"]
-      ipv6_cidr_blocks = ["::/0"]
-    },
-    {
-      description = "Allow SSH from internal network"
-      from_port = 22
-      to_port = 22
-      protocol = "tcp"
-      cidr_blocks = ["10.0.0.0/8"]
-      ipv6_cidr_blocks = []
-    }
-  ]
-  tags = {
-    Environment = "dev"
-    Project = random_pet.stack.id
-  }
-}
+	logFile, err := os.Create(logPath)
+	if err != nil {
+		return nil, fmt.Errorf("error creating log file: %v", err)
+	}
 
-module "ec2_key_pair" {
-  source = "./modules/keypair"
-  key_name = "${random_pet.stack.id}-key"
-  create_private_key = true
-  tags = {
-    Environment = "dev"
-    Project = random_pet.stack.id
-  }
-}
-
-module "web_server" {
-  source = "./modules/ec2"
-  instance_name = "${random_pet.stack.id}-web-server"
-  instance_type = "t2.micro"
-  subnet_id = module.vpc.public_subnet_ids[0]
-  vpc_security_group_ids = [module.sg.security_group_id]
-  key_name = module.ec2_key_pair.key_name
-  associate_public_ip_address = false
-  root_volume_size = 20
-  tags = {
-    Environment = "dev"
-    Project = random_pet.stack.id
-  }
-}
-
-module "bastion_host" {
-  source = "./modules/ec2"
-  instance_name = "${random_pet.stack.id}-bastion"
-  instance_type = "t2.micro"
-  subnet_id = module.vpc.public_subnet_ids[1]
-  vpc_security_group_ids = [module.sg.security_group_id]
-  key_name = module.ec2_key_pair.key_name
-  associate_public_ip_address = true
-  root_volume_size = 20
-  tags = {
-    Environment = "dev"
-    Project = random_pet.stack.id
-  }
+	log.SetOutput(logFile)
+	return logFile, nil
 }

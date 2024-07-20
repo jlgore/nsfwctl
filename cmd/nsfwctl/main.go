@@ -41,6 +41,8 @@ func main() {
 	// Initialize the UI model
 	initialState := ui.NewModel(repoPath)
 
+	go git.BackgroundFetch(repoPath) // Start background fetch
+
 	// Run the application
 	p := tea.NewProgram(initialState, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {

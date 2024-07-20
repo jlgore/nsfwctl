@@ -30,6 +30,7 @@ type Model struct {
 	status         string
 	selectedBranch string
 	state          ModelState
+	err            error
 }
 
 var (

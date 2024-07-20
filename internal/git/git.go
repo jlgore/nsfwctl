@@ -4,15 +4,52 @@ import (
 	"bufio"
 	"fmt"
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/jlgore/nsfwctl/pkg/utils"
 )
+
+var (
+	branchCache     []BranchInfo
+	branchCacheMux  sync.RWMutex
+	lastBranchFetch time.Time
+	lastFetchTime   time.Time
+)
+
+const fetchInterval = 5 * time.Minute
+
+func BackgroundFetch(repoPath string) {
+	go func() {
+		for {
+			time.Sleep(fetchInterval)
+			if time.Since(lastFetchTime) >= fetchInterval {
+				repo, err := git.PlainOpen(repoPath)
+				if err != nil {
+					continue
+				}
+				_ = fetchRepo(repo) // Ignore errors in background fetch
+				lastFetchTime = time.Now()
+			}
+		}
+	}()
+}
+
+func fetchIfNeeded(repo *git.Repository) error {
+	if time.Since(lastFetchTime) < fetchInterval {
+		return nil // Skip fetch if it was done recently
+	}
+	err := fetchRepo(repo)
+	if err == nil {
+		lastFetchTime = time.Now()
+	}
+	return err
+}
 
 func FetchSlides(repoPath, branchName string) (string, error) {
 	repo, err := git.PlainOpen(repoPath)
@@ -20,16 +57,38 @@ func FetchSlides(repoPath, branchName string) (string, error) {
 		return "", fmt.Errorf("error opening repository: %v", err)
 	}
 
+	// Fetch the latest changes from the remote
+	err = fetchRepo(repo)
+	if err != nil {
+		return "", fmt.Errorf("error fetching repository: %v", err)
+	}
+
 	w, err := repo.Worktree()
 	if err != nil {
 		return "", fmt.Errorf("error getting worktree: %v", err)
 	}
 
+	// Try to checkout the branch
 	err = w.Checkout(&git.CheckoutOptions{
-		Branch: plumbing.NewBranchReferenceName(branchName),
+		Branch: plumbing.NewRemoteReferenceName("origin", branchName),
+		Force:  true,
 	})
 	if err != nil {
-		return "", fmt.Errorf("error checking out branch: %v", err)
+		// If checkout fails, try to create and checkout the branch
+		err = w.Checkout(&git.CheckoutOptions{
+			Branch: plumbing.NewBranchReferenceName(branchName),
+			Create: true,
+			Force:  true,
+		})
+		if err != nil {
+			return "", fmt.Errorf("error checking out branch: %v", err)
+		}
+	}
+
+	// Pull the latest changes for the branch
+	err = w.Pull(&git.PullOptions{RemoteName: "origin"})
+	if err != nil && err != git.NoErrAlreadyUpToDate {
+		return "", fmt.Errorf("error pulling latest changes: %v", err)
 	}
 
 	slidesPath := filepath.Join(repoPath, "slides", "slides.md")
@@ -113,23 +172,27 @@ func fetchRepo(repo *git.Repository) error {
 }
 
 func FetchBranchesWithDescriptions(repoPath string) ([]BranchInfo, error) {
-	log.Printf("Starting FetchBranchesWithDescriptions for repo: %s", repoPath)
+	branchCacheMux.RLock()
+	if time.Since(lastBranchFetch) < fetchInterval && len(branchCache) > 0 {
+		defer branchCacheMux.RUnlock()
+		return branchCache, nil
+	}
+	branchCacheMux.RUnlock()
+
+	branchCacheMux.Lock()
+	defer branchCacheMux.Unlock()
+
 	repo, err := git.PlainOpen(repoPath)
 	if err != nil {
-		log.Printf("Error opening repository: %v", err)
 		return nil, fmt.Errorf("error opening repository: %v", err)
 	}
 
-	// Fetch updates before listing branches
-	if err := fetchRepo(repo); err != nil {
-		log.Printf("Error fetching repository: %v", err)
+	if err := fetchIfNeeded(repo); err != nil {
 		return nil, fmt.Errorf("error fetching repository: %v", err)
 	}
 
-	log.Print("Fetching remote references")
 	remotes, err := repo.Remotes()
 	if err != nil {
-		log.Printf("Error getting remotes: %v", err)
 		return nil, fmt.Errorf("error getting remotes: %v", err)
 	}
 
@@ -137,31 +200,26 @@ func FetchBranchesWithDescriptions(repoPath string) ([]BranchInfo, error) {
 	for _, remote := range remotes {
 		refs, err := remote.List(&git.ListOptions{})
 		if err != nil {
-			log.Printf("Error listing remote references: %v", err)
 			return nil, fmt.Errorf("error listing remote references: %v", err)
 		}
 
 		for _, ref := range refs {
 			if ref.Name().IsBranch() {
 				branchName := ref.Name().Short()
-				log.Printf("Processing branch: %s", branchName)
 				if utils.IsValidBranchName(branchName) {
 					description, _ := getBranchDescription(repo, branchName)
-					branchInfo := BranchInfo{
+					branchInfos = append(branchInfos, BranchInfo{
 						Name:        branchName,
 						Description: description,
-					}
-					log.Printf("Branch info: %+v", branchInfo)
-					branchInfos = append(branchInfos, branchInfo)
-				} else {
-					log.Printf("Invalid branch name: %s", branchName)
+					})
 				}
 			}
 		}
 	}
 
-	log.Printf("Total valid branches found: %d", len(branchInfos))
-	log.Printf("Returning %d branch infos", len(branchInfos))
+	branchCache = branchInfos
+	lastBranchFetch = time.Now()
+
 	return branchInfos, nil
 }
 

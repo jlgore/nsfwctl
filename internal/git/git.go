@@ -42,6 +42,7 @@ func FetchSlides(repoPath, branchName string) (string, error) {
 }
 
 // EnsureNsfwctlRepo ensures that the nsfwctl repository exists and is up to date
+
 func EnsureNsfwctlRepo(repoURL, branch string) (string, error) {
 	appDir, err := utils.GetAppDir()
 	if err != nil {
@@ -60,7 +61,7 @@ func EnsureNsfwctlRepo(repoURL, branch string) (string, error) {
 		return "", fmt.Errorf("error opening repository: %v", err)
 	}
 
-	if err := updateRepo(repo); err != nil {
+	if err := fetchRepo(repo); err != nil {
 		return "", err
 	}
 
@@ -80,26 +81,37 @@ func cloneRepo(repoURL, branch, repoDir string) (string, error) {
 	return repoDir, nil
 }
 
-func updateRepo(repo *git.Repository) error {
-	fmt.Println("Updating repository...")
-	w, err := repo.Worktree()
-	if err != nil {
-		return fmt.Errorf("error getting worktree: %v", err)
-	}
+// func updateRepo(repo *git.Repository) error {
+// 	fmt.Println("Updating repository...")
+// 	w, err := repo.Worktree()
+// 	if err != nil {
+// 		return fmt.Errorf("error getting worktree: %v", err)
+// 	}
 
-	err = w.Pull(&git.PullOptions{RemoteName: "origin"})
-	if err != nil && err != git.NoErrAlreadyUpToDate {
-		return fmt.Errorf("error pulling repository: %v", err)
-	}
-	return nil
-}
+// 	err = w.Pull(&git.PullOptions{RemoteName: "origin"})
+// 	if err != nil && err != git.NoErrAlreadyUpToDate {
+// 		return fmt.Errorf("error pulling repository: %v", err)
+// 	}
+// 	return nil
+// }
 
 type BranchInfo struct {
 	Name        string
 	Description string
 }
 
-// FetchBranchesWithDescriptions retrieves all branches and their descriptions
+func fetchRepo(repo *git.Repository) error {
+	fmt.Println("Fetching updates from remote...")
+	err := repo.Fetch(&git.FetchOptions{
+		RemoteName: "origin",
+		Progress:   nil,
+	})
+	if err != nil && err != git.NoErrAlreadyUpToDate {
+		return fmt.Errorf("error fetching repository: %v", err)
+	}
+	return nil
+}
+
 func FetchBranchesWithDescriptions(repoPath string) ([]BranchInfo, error) {
 	log.Printf("Starting FetchBranchesWithDescriptions for repo: %s", repoPath)
 	repo, err := git.PlainOpen(repoPath)
@@ -108,51 +120,65 @@ func FetchBranchesWithDescriptions(repoPath string) ([]BranchInfo, error) {
 		return nil, fmt.Errorf("error opening repository: %v", err)
 	}
 
-	log.Print("Fetching branches")
-	branches, err := repo.Branches()
+	// Fetch updates before listing branches
+	if err := fetchRepo(repo); err != nil {
+		log.Printf("Error fetching repository: %v", err)
+		return nil, fmt.Errorf("error fetching repository: %v", err)
+	}
+
+	log.Print("Fetching remote references")
+	remotes, err := repo.Remotes()
 	if err != nil {
-		log.Printf("Error fetching branches: %v", err)
-		return nil, fmt.Errorf("error fetching branches: %v", err)
+		log.Printf("Error getting remotes: %v", err)
+		return nil, fmt.Errorf("error getting remotes: %v", err)
 	}
 
 	var branchInfos []BranchInfo
-	err = branches.ForEach(func(ref *plumbing.Reference) error {
-		branchName := ref.Name().Short()
-		log.Printf("Processing branch: %s", branchName)
-		if utils.IsValidBranchName(branchName) {
-			description, _ := getBranchDescription(repo, branchName)
-			branchInfo := BranchInfo{
-				Name:        branchName,
-				Description: description,
-			}
-			log.Printf("Branch info: %+v", branchInfo)
-			branchInfos = append(branchInfos, branchInfo)
-		} else {
-			log.Printf("Invalid branch name: %s", branchName)
+	for _, remote := range remotes {
+		refs, err := remote.List(&git.ListOptions{})
+		if err != nil {
+			log.Printf("Error listing remote references: %v", err)
+			return nil, fmt.Errorf("error listing remote references: %v", err)
 		}
-		return nil
-	})
 
-	if err != nil {
-		log.Printf("Error iterating branches: %v", err)
-		return nil, fmt.Errorf("error iterating branches: %v", err)
+		for _, ref := range refs {
+			if ref.Name().IsBranch() {
+				branchName := ref.Name().Short()
+				log.Printf("Processing branch: %s", branchName)
+				if utils.IsValidBranchName(branchName) {
+					description, _ := getBranchDescription(repo, branchName)
+					branchInfo := BranchInfo{
+						Name:        branchName,
+						Description: description,
+					}
+					log.Printf("Branch info: %+v", branchInfo)
+					branchInfos = append(branchInfos, branchInfo)
+				} else {
+					log.Printf("Invalid branch name: %s", branchName)
+				}
+			}
+		}
 	}
 
 	log.Printf("Total valid branches found: %d", len(branchInfos))
 	log.Printf("Returning %d branch infos", len(branchInfos))
 	return branchInfos, nil
 }
+
 func getBranchDescription(repo *git.Repository, branchName string) (string, error) {
 	w, err := repo.Worktree()
 	if err != nil {
 		return "", err
 	}
 
+	// Try to checkout the branch
 	err = w.Checkout(&git.CheckoutOptions{
-		Branch: plumbing.NewBranchReferenceName(branchName),
+		Branch: plumbing.NewRemoteReferenceName("origin", branchName),
+		Force:  true,
 	})
 	if err != nil {
-		return "", err
+		// If checkout fails, it might be a remote-only branch
+		return "Remote branch - description not available", nil
 	}
 
 	descriptionPath := filepath.Join(w.Filesystem.Root(), "description.md")
